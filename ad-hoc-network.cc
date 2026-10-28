@@ -1,6 +1,7 @@
 #include "../src/aodv/helper/aodv-helper.h"
 #include "../src/applications/helper/udp-echo-helper.h"
 #include "../src/core/model/command-line.h"
+#include "../src/core/model/config.h"
 #include "../src/core/model/double.h"
 #include "../src/core/model/log.h"
 #include "../src/core/model/object.h"
@@ -36,22 +37,11 @@
 #include "../src/wifi/helper/yans-wifi-helper.h"
 #include "../src/wifi/model/wifi-standards.h"
 
-#include "ns3/aodv-module.h"
-#include "ns3/applications-module.h"
-#include "ns3/core-module.h"
-#include "ns3/dsdv-module.h"
-#include "ns3/dsr-module.h"
-#include "ns3/flow-monitor-module.h"
-#include "ns3/internet-module.h"
-#include "ns3/mesh-module.h"
-#include "ns3/mobility-module.h"
-#include "ns3/netanim-module.h"
-#include "ns3/network-module.h"
-#include "ns3/olsr-module.h"
-#include "ns3/wifi-module.h"
+#include "ns3/pointer.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <iomanip>
@@ -62,6 +52,7 @@
 
 namespace ns3
 {
+class UniformRandomVariable;
 class Socket;
 class FlowMonitor;
 }
@@ -139,6 +130,7 @@ static void OnUdpEchoClientTx(uint16_t flowId, Ptr<const Packet> p)
     uint32_t seq = g_e2eFlows[flowId].txPackets + 1;
     uint64_t nowNs = Simulator::Now().GetNanoSeconds();
     RecordE2ETx(flowId, seq, p->GetSize());
+
     g_uidToFlowMap[p->GetUid()] = {flowId, seq, nowNs};
     g_uidToFlowMap[(static_cast<uint64_t>(flowId) << 32) | seq] = {flowId, seq, nowNs};
 }
@@ -151,28 +143,53 @@ static void OnUdpEchoServerRx(uint16_t flowId, Ptr<const Packet> p, const Addres
         RecordE2ERx(it->second.flowId, it->second.seqNum, p->GetSize(), it->second.txTimeNs);
         return;
     }
-
     uint32_t nextRxSeq = g_e2eFlows[flowId].rxPackets + 1;
     uint64_t key = (static_cast<uint64_t>(flowId) << 32) | nextRxSeq;
-    auto itDsr = g_uidToFlowMap.find(key);
-    if (itDsr != g_uidToFlowMap.end())
+    auto itFallback = g_uidToFlowMap.find(key);
+    if (itFallback != g_uidToFlowMap.end())
     {
-        RecordE2ERx(flowId, itDsr->second.seqNum, p->GetSize(), itDsr->second.txTimeNs);
+        RecordE2ERx(flowId, itFallback->second.seqNum, p->GetSize(), itFallback->second.txTimeNs);
     }
 }
+
+
+enum OverlayPacketType : uint8_t
+{
+    PKT_DATA_BUNDLE = 1,
+    PKT_HELLO_BEACON = 2,
+    PKT_WATCHDOG_OVERHEAR = 3
+};
 
 #pragma pack(push, 1)
 struct OverlayWireHeader
 {
+    uint8_t pktType;
     uint32_t srcIp;
     uint32_t dstIp;
+    uint32_t prevHopIp;
     uint32_t seqNum;
     uint64_t txTimeNs;
     uint16_t flowId;
     uint16_t tickets;
     uint8_t ttl;
+    float posX;
+    float posY;
+    float batteryPct;
+    uint8_t neighborCnt;
+    uint32_t neighbors[6];
 };
 #pragma pack(pop)
+
+struct NeighborEntry
+{
+    Ipv4Address ip;
+    uint32_t nodeId;
+    Vector position;
+    double battery;
+    uint8_t degree;
+    std::vector<Ipv4Address> twoHopNeighbors;
+    Time lastSeen;
+};
 
 struct DtnBundle
 {
@@ -186,19 +203,21 @@ struct DtnBundle
     uint16_t tickets;
     uint8_t ttl;
     Time creationTime;
+    std::set<uint32_t> sprayedToNodes;
 };
+
 
 class UnifiedMeshRoutingApp : public Application
 {
 public:
     UnifiedMeshRoutingApp()
-        : m_initialTickets(8),
-          m_maxBufferSize(100),
-          m_checkInterval(Seconds(1.0)),
+        : m_initialTickets(16),
+          m_maxBufferSize(250),
+          m_checkInterval(Seconds(0.25)),
+          m_beaconInterval(Seconds(1.0)),
           m_nodeId(0),
           m_mode("AODV"),
           m_enableDtn(false),
-          m_radioRange(120.0),
           m_battery(100.0),
           m_lastNeighborCount(0)
     {
@@ -212,6 +231,8 @@ public:
                bool enableDtnFlag)
     {
         m_socket = socket;
+        m_socket->SetAllowBroadcast(true);
+        m_socket->BindToNetDevice(allNodes.Get(nodeIndex)->GetDevice(0));
         m_initialTickets = (enableDtnFlag || mode == "ADAPTIVE") ? L : 1;
         m_allNodes = allNodes;
         m_nodeId = nodeIndex;
@@ -248,8 +269,9 @@ public:
                             seq,
                             nowNs,
                             m_initialTickets,
-                            15,
-                            Simulator::Now()};
+                            18,
+                            Simulator::Now(),
+                            {}};
 
         m_buffer.push_back(bundle);
         ProcessRoutingQueue();
@@ -259,12 +281,18 @@ protected:
     void StartApplication() override
     {
         m_socket->SetRecvCallback(MakeCallback(&UnifiedMeshRoutingApp::HandleReceive, this));
+        // Stagger initial beacons with random jitter to prevent 802.11 broadcast collisions
+        Ptr<UniformRandomVariable> jitter = CreateObject<UniformRandomVariable>();
+        Simulator::Schedule(Seconds(jitter->GetValue(0.01, 0.4)),
+                            &UnifiedMeshRoutingApp::SendHelloBeacon,
+                            this);
         ScheduleNextCheck();
     }
 
     void StopApplication() override
     {
         Simulator::Cancel(m_timerEvent);
+        Simulator::Cancel(m_beaconEvent);
         if (m_socket)
         {
             m_socket->Close();
@@ -292,27 +320,83 @@ private:
         return m_nodeId;
     }
 
-    double GetDistanceBetween(uint32_t n1, uint32_t n2) const
+    Vector GetMyPosition() const
     {
-        Vector p1 = m_allNodes.Get(n1)->GetObject<MobilityModel>()->GetPosition();
-        Vector p2 = m_allNodes.Get(n2)->GetObject<MobilityModel>()->GetPosition();
-        return (p1 - p2).GetLength();
+        return m_allNodes.Get(m_nodeId)->GetObject<MobilityModel>()->GetPosition();
     }
 
-    std::vector<uint32_t> GetOneHopNeighbors(uint32_t nodeIdx) const
+    Vector GetDestinationPosition(uint32_t dstNodeIdx) const
     {
-        std::vector<uint32_t> neighbors;
-        for (uint32_t i = 0; i < m_allNodes.GetN(); ++i)
+        auto it = m_neighborTable.find(dstNodeIdx);
+        if (it != m_neighborTable.end())
         {
-            if (i != nodeIdx && GetDistanceBetween(nodeIdx, i) <= m_radioRange)
+            return it->second.position;
+        }
+        return m_allNodes.Get(dstNodeIdx)->GetObject<MobilityModel>()->GetPosition();
+    }
+
+    std::vector<NeighborEntry> GetActiveBeaconNeighbors()
+    {
+        Time now = Simulator::Now();
+        std::vector<NeighborEntry> active;
+        for (auto it = m_neighborTable.begin(); it != m_neighborTable.end();)
+        {
+            if ((now - it->second.lastSeen) > Seconds(3.0))
             {
-                neighbors.push_back(i);
+                it = m_neighborTable.erase(it);
+            }
+            else
+            {
+                active.push_back(it->second);
+                ++it;
             }
         }
-        return neighbors;
+        return active;
     }
 
-    bool HasActiveL3Route(Ipv4Address dstIp) const
+    void SendHelloBeacon()
+    {
+        std::vector<NeighborEntry> activeNbs = GetActiveBeaconNeighbors();
+        Vector myPos = GetMyPosition();
+        Ipv4Address myIp = GetNodeIp(m_nodeId);
+
+        OverlayWireHeader beacon = {};
+        beacon.pktType = PKT_HELLO_BEACON;
+        beacon.srcIp = myIp.Get();
+        beacon.prevHopIp = myIp.Get();
+        beacon.posX = static_cast<float>(myPos.x);
+        beacon.posY = static_cast<float>(myPos.y);
+        beacon.batteryPct = static_cast<float>(m_battery);
+        beacon.neighborCnt = static_cast<uint8_t>(std::min<size_t>(6, activeNbs.size()));
+
+        for (size_t i = 0; i < beacon.neighborCnt; ++i)
+        {
+            beacon.neighbors[i] = activeNbs[i].ip.Get();
+        }
+
+        Ptr<Packet> pkt = Create<Packet>(reinterpret_cast<const uint8_t*>(&beacon),
+                                         sizeof(OverlayWireHeader));
+        m_socket->SendTo(pkt, 0, InetSocketAddress(Ipv4Address::GetBroadcast(), 9999));
+
+        if (m_mode == "ADAPTIVE")
+        {
+            if (activeNbs.size() == m_lastNeighborCount)
+            {
+                m_beaconInterval = Seconds(std::min(3.0, m_beaconInterval.GetSeconds() * 1.5));
+            }
+            else
+            {
+                m_beaconInterval = Seconds(0.5);
+                m_lastNeighborCount = activeNbs.size();
+            }
+        }
+
+        m_beaconEvent = Simulator::Schedule(m_beaconInterval,
+                                            &UnifiedMeshRoutingApp::SendHelloBeacon,
+                                            this);
+    }
+
+    bool GetActiveL3NextHop(Ipv4Address dstIp, Ipv4Address& outGateway) const
     {
         if (m_mode == "DSR" || m_mode == "HWMP")
         {
@@ -333,8 +417,11 @@ private:
         Ptr<Ipv4Route> route =
             ipv4->GetRoutingProtocol()->RouteOutput(probePkt, ipHdr, nullptr, sockerr);
 
-        if (route && route->GetGateway() != Ipv4Address("127.0.0.1"))
+        if (route && route->GetGateway() != Ipv4Address("127.0.0.1") &&
+            route->GetGateway() != GetNodeIp(m_nodeId))
         {
+            outGateway = (route->GetGateway() == Ipv4Address("0.0.0.0")) ? dstIp
+                                                                         : route->GetGateway();
             return true;
         }
         return false;
@@ -347,13 +434,17 @@ private:
             return;
         }
 
-        OverlayWireHeader wireHdr = {b.source.Get(),
-                                     b.destination.Get(),
-                                     b.seqNum,
-                                     b.txTimeNs,
-                                     b.flowId,
-                                     ticketsToGive,
-                                     static_cast<uint8_t>(b.ttl - 1)};
+        Ipv4Address myIp = GetNodeIp(m_nodeId);
+        OverlayWireHeader wireHdr = {};
+        wireHdr.pktType = PKT_DATA_BUNDLE;
+        wireHdr.srcIp = b.source.Get();
+        wireHdr.dstIp = b.destination.Get();
+        wireHdr.prevHopIp = myIp.Get();
+        wireHdr.seqNum = b.seqNum;
+        wireHdr.txTimeNs = b.txTimeNs;
+        wireHdr.flowId = b.flowId;
+        wireHdr.tickets = ticketsToGive;
+        wireHdr.ttl = static_cast<uint8_t>(b.ttl - 1);
 
         uint32_t totalSize = std::max<uint32_t>(b.payloadSize, sizeof(OverlayWireHeader));
         std::vector<uint8_t> rawBuf(totalSize, 0);
@@ -361,50 +452,51 @@ private:
 
         Ptr<Packet> pkt = Create<Packet>(rawBuf.data(), totalSize);
         m_socket->SendTo(pkt, 0, InetSocketAddress(nextHopIp, b.port));
-        m_battery = std::max(5.0, m_battery - 0.15);
+        m_battery = std::max(5.0, m_battery - 0.05);
+
+        if (m_mode == "SECURITY" && nextHopIp != b.destination)
+        {
+            uint32_t relayIdx = GetNodeIndexByIp(nextHopIp);
+            uint64_t wdKey = (static_cast<uint64_t>(b.seqNum) << 16) | relayIdx;
+            m_pendingWatchdog[wdKey] = Simulator::Now();
+            Simulator::Schedule(Seconds(0.8),
+                                &UnifiedMeshRoutingApp::VerifyWatchdogForwarding,
+                                this,
+                                b.seqNum,
+                                relayIdx);
+        }
+    }
+
+    void VerifyWatchdogForwarding(uint32_t seqNum, uint32_t relayIdx)
+    {
+        uint64_t wdKey = (static_cast<uint64_t>(seqNum) << 16) | relayIdx;
+        auto it = m_pendingWatchdog.find(wdKey);
+        if (it != m_pendingWatchdog.end())
+        {
+            m_trustScores[relayIdx] = std::max(0.0, m_trustScores[relayIdx] - 0.30);
+            m_pendingWatchdog.erase(it);
+        }
     }
 
     void ProcessRoutingQueue()
     {
-        std::vector<uint32_t> neighbors = GetOneHopNeighbors(m_nodeId);
+        std::vector<NeighborEntry> neighbors = GetActiveBeaconNeighbors();
         Time now = Simulator::Now();
-
-        if (m_mode == "SECURITY")
-        {
-            for (uint32_t nb : neighbors)
-            {
-                if (nb == 7 || nb == 14 || nb == 21)
-                {
-                    m_trustScores[nb] = std::max(0.0, m_trustScores[nb] - 0.25);
-                }
-            }
-        }
-
-        if (m_mode == "ADAPTIVE")
-        {
-            if (neighbors.size() == m_lastNeighborCount)
-            {
-                m_checkInterval = Seconds(std::min(8.0, m_checkInterval.GetSeconds() * 2.0));
-            }
-            else
-            {
-                m_checkInterval = Seconds(0.5);
-                m_lastNeighborCount = neighbors.size();
-            }
-        }
+        Vector myPos = GetMyPosition();
 
         for (auto it = m_buffer.begin(); it != m_buffer.end();)
         {
-            if (!m_enableDtn && (now - it->creationTime) > Seconds(2.0))
+            if (!m_enableDtn && (now - it->creationTime) > Seconds(2.5))
             {
                 it = m_buffer.erase(it);
                 continue;
             }
 
             uint32_t dstNodeIdx = GetNodeIndexByIp(it->destination);
-            bool deliveredOrForwarded = false;
+            Vector dstPos = GetDestinationPosition(dstNodeIdx);
+            bool forwardedPrimary = false;
 
-            if (GetDistanceBetween(m_nodeId, dstNodeIdx) <= m_radioRange)
+            if (m_neighborTable.find(dstNodeIdx) != m_neighborTable.end())
             {
                 TransmitBundleTo(*it, it->destination, 1);
                 it = m_buffer.erase(it);
@@ -413,156 +505,198 @@ private:
 
             if (m_mode == "AODV" || m_mode == "OLSR" || m_mode == "DSDV" || m_mode == "HYBRID")
             {
-                if (HasActiveL3Route(it->destination))
+                Ipv4Address l3NextHop;
+                if (GetActiveL3NextHop(it->destination, l3NextHop))
                 {
                     TransmitBundleTo(*it, it->destination, 1);
-                    deliveredOrForwarded = true;
+                    forwardedPrimary = true;
                 }
             }
             else if (m_mode == "GRP" || m_mode == "GPSR")
             {
-                double myDistToDst = GetDistanceBetween(m_nodeId, dstNodeIdx);
-                uint32_t bestNb = m_nodeId;
-                double bestDist = myDistToDst;
+                double myDist = (myPos - dstPos).GetLength();
+                Ipv4Address bestNbIp = Ipv4Address("0.0.0.0");
+                double bestDist = myDist;
 
-                for (uint32_t nb : neighbors)
+                for (const auto& nb : neighbors)
                 {
-                    double d = GetDistanceBetween(nb, dstNodeIdx);
+                    double d = (nb.position - dstPos).GetLength();
                     if (d < bestDist)
                     {
                         bestDist = d;
-                        bestNb = nb;
+                        bestNbIp = nb.ip;
                     }
                 }
-                if (bestNb == m_nodeId && !neighbors.empty() && !m_enableDtn)
+                if (bestNbIp == Ipv4Address("0.0.0.0") && !neighbors.empty() && !m_enableDtn)
                 {
-                    bestNb = neighbors.front();
+                    bestNbIp = neighbors.front().ip;
                 }
-                if (bestNb != m_nodeId)
+                if (bestNbIp != Ipv4Address("0.0.0.0"))
                 {
-                    TransmitBundleTo(*it, GetNodeIp(bestNb), 1);
-                    deliveredOrForwarded = true;
+                    TransmitBundleTo(*it, bestNbIp, 1);
+                    forwardedPrimary = true;
                 }
             }
             else if (m_mode == "ZRP")
             {
-                uint32_t iarpNextHop = m_nodeId;
-                std::vector<uint32_t> peripheralNodes;
+                Ipv4Address iarpNextHop = Ipv4Address("0.0.0.0");
+                std::vector<NeighborEntry> borderNodes;
 
-                for (uint32_t nb : neighbors)
+                for (const auto& nb : neighbors)
                 {
-                    for (uint32_t nb2 : GetOneHopNeighbors(nb))
+                    for (const auto& twoHopIp : nb.twoHopNeighbors)
                     {
-                        if (nb2 == dstNodeIdx)
+                        if (twoHopIp == it->destination)
                         {
-                            iarpNextHop = nb;
+                            iarpNextHop = nb.ip;
                             break;
                         }
-                        if (GetDistanceBetween(m_nodeId, nb2) > m_radioRange)
-                        {
-                            peripheralNodes.push_back(nb);
-                        }
+                    }
+                    if (nb.degree > 1)
+                    {
+                        borderNodes.push_back(nb);
                     }
                 }
 
-                if (iarpNextHop != m_nodeId)
+                if (iarpNextHop != Ipv4Address("0.0.0.0"))
                 {
-                    TransmitBundleTo(*it, GetNodeIp(iarpNextHop), 1);
-                    deliveredOrForwarded = true;
+                    TransmitBundleTo(*it, iarpNextHop, 1);
+                    forwardedPrimary = true;
                 }
-                else if (!peripheralNodes.empty())
+                else if (!borderNodes.empty())
                 {
-                    std::sort(peripheralNodes.begin(),
-                              peripheralNodes.end(),
-                              [&](uint32_t a, uint32_t b) {
-                                  return GetDistanceBetween(a, dstNodeIdx) <
-                                         GetDistanceBetween(b, dstNodeIdx);
+                    std::sort(borderNodes.begin(),
+                              borderNodes.end(),
+                              [&](const NeighborEntry& a, const NeighborEntry& b) {
+                                  return (a.position - dstPos).GetLength() <
+                                         (b.position - dstPos).GetLength();
                               });
-                    TransmitBundleTo(*it, GetNodeIp(peripheralNodes.front()), 1);
-                    deliveredOrForwarded = true;
+                    TransmitBundleTo(*it, borderNodes.front().ip, 1);
+                    forwardedPrimary = true;
                 }
             }
             else if (m_mode == "MULTIPATH")
             {
-                if (!neighbors.empty())
+                Ipv4Address primaryGateway = Ipv4Address("0.0.0.0");
+                if (GetActiveL3NextHop(it->destination, primaryGateway))
                 {
-                    std::vector<uint32_t> sortedNbs = neighbors;
-                    std::sort(sortedNbs.begin(), sortedNbs.end(), [&](uint32_t a, uint32_t b) {
-                        return GetDistanceBetween(a, dstNodeIdx) <
-                               GetDistanceBetween(b, dstNodeIdx);
-                    });
-                    uint32_t kPaths = std::min<size_t>(2, sortedNbs.size());
-                    for (uint32_t k = 0; k < kPaths; ++k)
+                    TransmitBundleTo(*it, primaryGateway, 1);
+                    forwardedPrimary = true;
+                }
+
+                std::vector<NeighborEntry> sortedNbs = neighbors;
+                std::sort(sortedNbs.begin(),
+                          sortedNbs.end(),
+                          [&](const NeighborEntry& a, const NeighborEntry& b) {
+                              return (a.position - dstPos).GetLength() <
+                                     (b.position - dstPos).GetLength();
+                          });
+
+                uint32_t sentCount = forwardedPrimary ? 1 : 0;
+                for (const auto& nb : sortedNbs)
+                {
+                    if (nb.ip != primaryGateway && sentCount < 2)
                     {
-                        TransmitBundleTo(*it, GetNodeIp(sortedNbs[k]), 1);
-                        deliveredOrForwarded = true;
+                        TransmitBundleTo(*it, nb.ip, 1);
+                        forwardedPrimary = true;
+                        sentCount++;
                     }
                 }
             }
             else if (m_mode == "SECURITY")
             {
-                uint32_t bestTrustedNb = m_nodeId;
-                double minCost = 1e9;
-                for (uint32_t nb : neighbors)
+                Ipv4Address aodvGateway;
+                if (GetActiveL3NextHop(it->destination, aodvGateway))
                 {
-                    if (m_trustScores[nb] < 0.5)
+                    uint32_t gwIdx = GetNodeIndexByIp(aodvGateway);
+                    if (m_trustScores[gwIdx] >= 0.5)
                     {
-                        continue;
-                    }
-                    double cost =
-                        GetDistanceBetween(nb, dstNodeIdx) / std::max(0.1, m_trustScores[nb]);
-                    if (cost < minCost)
-                    {
-                        minCost = cost;
-                        bestTrustedNb = nb;
+                        TransmitBundleTo(*it, aodvGateway, 1);
+                        forwardedPrimary = true;
                     }
                 }
-                if (bestTrustedNb != m_nodeId)
+
+                if (!forwardedPrimary)
                 {
-                    TransmitBundleTo(*it, GetNodeIp(bestTrustedNb), 1);
-                    deliveredOrForwarded = true;
+                    Ipv4Address bestTrustedIp = Ipv4Address("0.0.0.0");
+                    double minCost = 1e9;
+                    for (const auto& nb : neighbors)
+                    {
+                        if (m_trustScores[nb.nodeId] < 0.5)
+                        {
+                            continue; // Isolate Blackhole node flagged by Watchdog
+                        }
+                        double dist = (nb.position - dstPos).GetLength();
+                        double cost = dist / std::max(0.1, m_trustScores[nb.nodeId]);
+                        if (cost < minCost)
+                        {
+                            minCost = cost;
+                            bestTrustedIp = nb.ip;
+                        }
+                    }
+                    if (bestTrustedIp != Ipv4Address("0.0.0.0"))
+                    {
+                        TransmitBundleTo(*it, bestTrustedIp, 1);
+                        forwardedPrimary = true;
+                    }
                 }
             }
             else if (m_mode == "ADAPTIVE")
             {
                 if (neighbors.size() >= 3)
                 {
-                    double w2 = (m_battery < 30.0) ? 0.8 : 0.2;
-                    double w1 = 1.0 - w2;
-                    uint32_t bestAdaptiveNb = m_nodeId;
-                    double bestScore = 1e9;
-                    for (uint32_t nb : neighbors)
+                    Ipv4Address l3Gw;
+                    if (GetActiveL3NextHop(it->destination, l3Gw))
                     {
-                        double cost = (w1 * (GetDistanceBetween(nb, dstNodeIdx) / 450.0)) +
-                                      (w2 * ((100.0 - m_battery) / 100.0));
-                        if (cost < bestScore)
-                        {
-                            bestScore = cost;
-                            bestAdaptiveNb = nb;
-                        }
+                        TransmitBundleTo(*it, it->destination, 1);
+                        forwardedPrimary = true;
                     }
-                    if (bestAdaptiveNb != m_nodeId)
+                    else
                     {
-                        TransmitBundleTo(*it, GetNodeIp(bestAdaptiveNb), 1);
-                        deliveredOrForwarded = true;
+                        double w2 = (m_battery < 30.0) ? 0.8 : 0.2;
+                        double w1 = 1.0 - w2;
+                        Ipv4Address bestIp = Ipv4Address("0.0.0.0");
+                        double bestScore = 1e9;
+                        for (const auto& nb : neighbors)
+                        {
+                            double normDist = (nb.position - dstPos).GetLength() / 450.0;
+                            double energyPen = (100.0 - nb.battery) / 100.0;
+                            double cost = (w1 * normDist) + (w2 * energyPen);
+                            if (cost < bestScore)
+                            {
+                                bestScore = cost;
+                                bestIp = nb.ip;
+                            }
+                        }
+                        if (bestIp != Ipv4Address("0.0.0.0"))
+                        {
+                            TransmitBundleTo(*it, bestIp, 1);
+                            forwardedPrimary = true;
+                        }
                     }
                 }
             }
 
-            if (!deliveredOrForwarded && (m_enableDtn || m_mode == "ADAPTIVE"))
+            if (m_enableDtn || m_mode == "ADAPTIVE")
             {
-                for (uint32_t nb : neighbors)
+                for (const auto& nb : neighbors)
                 {
-                    if (it->tickets > 1)
+                    if (m_mode == "SECURITY" && m_trustScores[nb.nodeId] < 0.5)
+                    {
+                        continue;
+                    }
+                    if (it->tickets > 1 &&
+                        it->sprayedToNodes.find(nb.nodeId) == it->sprayedToNodes.end())
                     {
                         uint16_t sprayed = it->tickets / 2;
                         it->tickets -= sprayed;
-                        TransmitBundleTo(*it, GetNodeIp(nb), sprayed);
+                        it->sprayedToNodes.insert(nb.nodeId);
+                        TransmitBundleTo(*it, nb.ip, sprayed);
                     }
                 }
             }
 
-            if (deliveredOrForwarded)
+            if (forwardedPrimary && !m_enableDtn)
             {
                 it = m_buffer.erase(it);
             }
@@ -599,6 +733,40 @@ private:
             OverlayWireHeader wireHdr;
             packet->CopyData(reinterpret_cast<uint8_t*>(&wireHdr), sizeof(OverlayWireHeader));
 
+            if (wireHdr.pktType == PKT_HELLO_BEACON)
+            {
+                Ipv4Address senderIp(wireHdr.srcIp);
+                if (senderIp == myIp)
+                {
+                    continue;
+                }
+                uint32_t senderIdx = GetNodeIndexByIp(senderIp);
+                NeighborEntry entry;
+                entry.ip = senderIp;
+                entry.nodeId = senderIdx;
+                entry.position = Vector(wireHdr.posX, wireHdr.posY, 0.0);
+                entry.battery = wireHdr.batteryPct;
+                entry.degree = wireHdr.neighborCnt;
+                entry.lastSeen = Simulator::Now();
+                for (uint8_t k = 0; k < wireHdr.neighborCnt && k < 6; ++k)
+                {
+                    entry.twoHopNeighbors.emplace_back(wireHdr.neighbors[k]);
+                }
+                m_neighborTable[senderIdx] = entry;
+                continue;
+            }
+
+            if (wireHdr.pktType == PKT_WATCHDOG_OVERHEAR)
+            {
+                uint32_t relayIdx = GetNodeIndexByIp(Ipv4Address(wireHdr.prevHopIp));
+                uint64_t wdKey = (static_cast<uint64_t>(wireHdr.seqNum) << 16) | relayIdx;
+                if (m_pendingWatchdog.erase(wdKey) > 0)
+                {
+                    m_trustScores[relayIdx] = std::min(1.0, m_trustScores[relayIdx] + 0.05);
+                }
+                continue;
+            }
+
             if (m_mode == "SECURITY" && (m_nodeId == 7 || m_nodeId == 14 || m_nodeId == 21))
             {
                 continue;
@@ -606,6 +774,7 @@ private:
 
             Ipv4Address dstIp(wireHdr.dstIp);
             Ipv4Address srcIp(wireHdr.srcIp);
+            Ipv4Address prevHopIp(wireHdr.prevHopIp);
 
             if (dstIp == myIp)
             {
@@ -614,6 +783,17 @@ private:
                             packet->GetSize(),
                             wireHdr.txTimeNs);
                 continue;
+            }
+
+            if (m_mode == "SECURITY" && prevHopIp != myIp)
+            {
+                OverlayWireHeader wdAck = {};
+                wdAck.pktType = PKT_WATCHDOG_OVERHEAR;
+                wdAck.prevHopIp = myIp.Get();
+                wdAck.seqNum = wireHdr.seqNum;
+                Ptr<Packet> wdPkt = Create<Packet>(reinterpret_cast<const uint8_t*>(&wdAck),
+                                                   sizeof(OverlayWireHeader));
+                m_socket->SendTo(wdPkt, 0, InetSocketAddress(prevHopIp, 9999));
             }
 
             if (m_seenPackets.find(wireHdr.seqNum) != m_seenPackets.end())
@@ -633,7 +813,8 @@ private:
                                          wireHdr.txTimeNs,
                                          wireHdr.tickets,
                                          wireHdr.ttl,
-                                         Simulator::Now()};
+                                         Simulator::Now(),
+                                         {GetNodeIndexByIp(prevHopIp)}};
                 m_buffer.push_back(relayBundle);
             }
         }
@@ -643,37 +824,43 @@ private:
     uint16_t m_initialTickets;
     uint32_t m_maxBufferSize;
     Time m_checkInterval;
+    Time m_beaconInterval;
     EventId m_timerEvent;
+    EventId m_beaconEvent;
     NodeContainer m_allNodes;
     uint32_t m_nodeId;
     std::string m_mode;
     bool m_enableDtn;
-    double m_radioRange;
     double m_battery;
     size_t m_lastNeighborCount;
     std::deque<DtnBundle> m_buffer;
     std::set<uint32_t> m_seenPackets;
+    std::map<uint32_t, NeighborEntry> m_neighborTable;
     std::map<uint32_t, double> m_trustScores;
+    std::map<uint64_t, Time> m_pendingWatchdog;
 };
 
 uint32_t UnifiedMeshRoutingApp::s_globalSeqCounter = 0;
 
-// Main Simulation Script
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
-    double simTime = 110.0; // Total simulation time in seconds
-    uint32_t numNodes = 30; // 30 emergency mesh nodes
+    Config::SetDefault("ns3::aodv::RoutingProtocol::RreqRetries", UintegerValue(2));
+    Config::SetDefault("ns3::aodv::RoutingProtocol::ActiveRouteTimeout", TimeValue(Seconds(10.0)));
+    double simTime = 110.0;
+    uint32_t numNodes = 30;
     std::string protocol = "ADAPTIVE";
     bool enableDtn = false;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("simTime", "Total simulation time in seconds", simTime);
-    cmd.AddValue("protocol", "Protocol: AODV, OLSR, DSDV, DSR, HWMP, HYBRID, ZRP, GRP, MULTIPATH,"
-                             " SECURITY, ADAPTIVE",
-        protocol);
+    cmd.AddValue("protocol",
+                 "Protocol: AODV, OLSR, DSDV, DSR, HWMP, HYBRID, ZRP, GRP, MULTIPATH, SECURITY, ADAPTIVE",
+                 protocol);
     cmd.AddValue("enableDtn", "Enable DTN Spray & Wait Fallback Application", enableDtn);
     cmd.Parse(argc, argv);
+
+    std::transform(protocol.begin(), protocol.end(), protocol.begin(), ::toupper);
 
     Time::SetResolution(Time::NS);
     PacketMetadata::Enable();
@@ -681,36 +868,54 @@ int main(int argc, char *argv[])
     NodeContainer nodes;
     nodes.Create(numNodes);
 
-    YansWifiChannelHelper wifiChannel = YansWifiChannelHelper::Default();
+    YansWifiChannelHelper wifiChannel;
     wifiChannel.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(120.0));
+    wifiChannel.AddPropagationLoss("ns3::LogDistancePropagationLossModel",
+                                   "Exponent",
+                                   DoubleValue(2.5),
+                                   "ReferenceDistance",
+                                   DoubleValue(1.0),
+                                   "ReferenceLoss",
+                                   DoubleValue(40.0));
+    wifiChannel.AddPropagationLoss("ns3::RangePropagationLossModel",
+                                   "MaxRange",
+                                   DoubleValue(200.0));
 
     YansWifiPhyHelper wifiPhy;
     wifiPhy.SetChannel(wifiChannel.Create());
+    wifiPhy.Set("TxPowerStart", DoubleValue(20.0));
+    wifiPhy.Set("TxPowerEnd", DoubleValue(20.0));
+    wifiPhy.Set("TxGain", DoubleValue(3.0));
+    wifiPhy.Set("RxGain", DoubleValue(3.0));
+    Config::SetDefault("ns3::WifiRemoteStationManager::RtsCtsThreshold", StringValue("500"));
 
     WifiHelper wifi;
-    wifi.SetStandard(WIFI_STANDARD_80211b);
+    wifi.SetStandard(WIFI_STANDARD_80211g);
+    wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+                                 "DataMode",
+                                 StringValue("ErpOfdmRate12Mbps"),
+                                 "ControlMode",
+                                 StringValue("ErpOfdmRate6Mbps"));
 
     NetDeviceContainer devices;
     InternetStackHelper stack;
 
-    bool useOverlayEngine = enableDtn || (protocol == "ZRP" || protocol == "GRP" || protocol ==
-        "GPSR" || protocol == "MULTIPATH" || protocol == "SECURITY" || protocol == "ADAPTIVE");
+    bool useOverlayEngine = enableDtn || (protocol == "ZRP" || protocol == "GRP" ||
+                                          protocol == "GPSR" || protocol == "MULTIPATH" ||
+                                          protocol == "SECURITY" || protocol == "ADAPTIVE");
 
     if (protocol == "HWMP")
     {
         MeshHelper mesh = MeshHelper::Default();
         mesh.SetStackInstaller("ns3::Dot11sStack");
+        mesh.SetSpreadInterfaceChannels(MeshHelper::ZERO_CHANNEL);
+        mesh.SetMacType("RandomStart", TimeValue(Seconds(0.1)));
         mesh.SetNumberOfInterfaces(1);
-
         devices = mesh.Install(wifiPhy, nodes);
         stack.Install(nodes);
     }
     else
     {
-        wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager", "DataMode", StringValue
-            ("DsssRate2Mbps"), "ControlMode", StringValue("DsssRate1Mbps"));
-
         WifiMacHelper wifiMac;
         wifiMac.SetType("ns3::AdhocWifiMac");
         devices = wifi.Install(wifiPhy, wifiMac, nodes);
@@ -724,19 +929,22 @@ int main(int argc, char *argv[])
         else if (protocol == "DSDV")
         {
             DsdvHelper dsdv;
-            dsdv.Set("PeriodicUpdateInterval", TimeValue(Seconds(15.0)));
-            dsdv.Set("SettlingTime", TimeValue(Seconds(5.0)));
+            dsdv.Set("PeriodicUpdateInterval", TimeValue(Seconds(10.0)));
+            dsdv.Set("SettlingTime", TimeValue(Seconds(2.0)));
             stack.SetRoutingHelper(dsdv);
             stack.Install(nodes);
         }
         else if (protocol == "DSR")
         {
             stack.Install(nodes);
-            Simulator::Schedule(Seconds(0.001), [nodes]() {
-                DsrMainHelper dsrMain;
-                DsrHelper dsr;
-                dsrMain.Install(dsr, nodes);
-            });
+            if (!enableDtn)
+            {
+                Simulator::Schedule(Seconds(0.001), [nodes]() {
+                    DsrMainHelper dsrMain;
+                    DsrHelper dsr;
+                    dsrMain.Install(dsr, nodes);
+                });
+            }
         }
         else if (protocol == "HYBRID" || protocol == "ADAPTIVE")
         {
@@ -764,22 +972,50 @@ int main(int argc, char *argv[])
 
     Ptr<RandomRectanglePositionAllocator> positionAlloc =
         CreateObject<RandomRectanglePositionAllocator>();
-    positionAlloc->SetAttribute("X", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=300.0]"));
-    positionAlloc->SetAttribute("Y", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=300.0]"));
+    positionAlloc->SetAttribute("X", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=350.0]"));
+    positionAlloc->SetAttribute("Y", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=350.0]"));
 
-    MobilityHelper mobility;
-    mobility.SetPositionAllocator(positionAlloc);
+    NodeContainer rescuerNodes;
+    NodeContainer carrierNodes;
+    for (uint32_t i = 0; i < numNodes; ++i)
+    {
+        if (i < 24)
+        {
+            rescuerNodes.Add(nodes.Get(i));
+        }
+        else
+        {
+            carrierNodes.Add(nodes.Get(i));
+        }
+    }
 
-    mobility.SetMobilityModel("ns3::RandomWaypointMobilityModel", "Speed", StringValue
-        ("ns3::UniformRandomVariable[Min=1.0|Max=3.0]"), "Pause", StringValue
-        ("ns3::ConstantRandomVariable[Constant=2.0]"), "PositionAllocator", PointerValue
-        (positionAlloc));
+    MobilityHelper rescuerMobility;
+    rescuerMobility.SetPositionAllocator(positionAlloc);
+    rescuerMobility.SetMobilityModel("ns3::RandomWaypointMobilityModel",
+                                     "Speed",
+                                     StringValue("ns3::UniformRandomVariable[Min=0.5|Max=1.5]"),
+                                     "Pause",
+                                     StringValue("ns3::ConstantRandomVariable[Constant=10.0]"),
+                                     "PositionAllocator",
+                                     PointerValue(positionAlloc));
+    rescuerMobility.Install(rescuerNodes);
 
-    mobility.Install(nodes);
+    MobilityHelper carrierMobility;
+    carrierMobility.SetPositionAllocator(positionAlloc);
+    carrierMobility.SetMobilityModel("ns3::RandomWaypointMobilityModel",
+                                     "Speed",
+                                     StringValue("ns3::UniformRandomVariable[Min=5.0|Max=12.0]"),
+                                     "Pause",
+                                     StringValue("ns3::ConstantRandomVariable[Constant=2.0]"),
+                                     "PositionAllocator",
+                                     PointerValue(positionAlloc));
+    carrierMobility.Install(carrierNodes);
+
+    uint32_t pktSize = 1024;
+    uint32_t numPktsPerFlow = 200;
+    double pktIntervalSec = 0.25;
 
     uint16_t basePort = useOverlayEngine ? 9999 : 9;
-    g_e2eFlows[1] = {1, interfaces.GetAddress(0), basePort, interfaces.GetAddress(29), basePort};
-
     g_e2eFlows[1] = {1, interfaces.GetAddress(0), basePort, interfaces.GetAddress(29), basePort};
     g_e2eFlows[2] = {2,
                      interfaces.GetAddress(5),
@@ -799,81 +1035,33 @@ int main(int argc, char *argv[])
 
     if (!useOverlayEngine)
     {
-        // Pair 1: Node 0 -> Node 29 (Port 9)
-        UdpEchoServerHelper server1(9);
-        ApplicationContainer sApps1 = server1.Install(nodes.Get(29));
-        sApps1.Start(Seconds(1.0));
-        sApps1.Stop(Seconds(simTime));
-        sApps1.Get(0)->TraceConnectWithoutContext("Rx", MakeBoundCallback(&OnUdpEchoServerRx,
-            static_cast<uint16_t>(1)));
+        uint32_t srcNodes[4] = {0, 5, 10, 15};
+        uint32_t dstNodes[4] = {29, 25, 20, 28};
+        uint16_t ports[4] = {9, 10, 11, 12};
+        double startTimes[4] = {3.0, 4.0, 5.0, 6.0};
 
-        UdpEchoClientHelper client1(interfaces.GetAddress(29), 9);
-        client1.SetAttribute("MaxPackets", UintegerValue(45));
-        client1.SetAttribute("Interval", TimeValue(Seconds(2.0)));
-        client1.SetAttribute("PacketSize", UintegerValue(250));
-        ApplicationContainer cApps1 = client1.Install(nodes.Get(0));
-        cApps1.Start(Seconds(3.0));
-        cApps1.Stop(Seconds(simTime));
-        cApps1.Get(0)->TraceConnectWithoutContext(
-            "Tx",
-            MakeBoundCallback(&OnUdpEchoClientTx, static_cast<uint16_t>(1)));
+        for (int f = 0; f < 4; ++f)
+        {
+            uint16_t flowId = static_cast<uint16_t>(f + 1);
+            UdpEchoServerHelper server(ports[f]);
+            ApplicationContainer sApps = server.Install(nodes.Get(dstNodes[f]));
+            sApps.Start(Seconds(1.0));
+            sApps.Stop(Seconds(simTime));
+            sApps.Get(0)->TraceConnectWithoutContext(
+                "Rx",
+                MakeBoundCallback(&OnUdpEchoServerRx, flowId));
 
-        // Pair 2: Node 5 -> Node 25 (Port 10)
-        UdpEchoServerHelper server2(10);
-        ApplicationContainer sApps2 = server2.Install(nodes.Get(25));
-        sApps2.Start(Seconds(1.0));
-        sApps2.Stop(Seconds(simTime));
-        sApps2.Get(0)->TraceConnectWithoutContext("Rx", MakeBoundCallback(&OnUdpEchoServerRx,
-            static_cast<uint16_t>(2)));
-
-        UdpEchoClientHelper client2(interfaces.GetAddress(25), 10);
-        client2.SetAttribute("MaxPackets", UintegerValue(45));
-        client2.SetAttribute("Interval", TimeValue(Seconds(2.0)));
-        client2.SetAttribute("PacketSize", UintegerValue(250));
-        ApplicationContainer cApps2 = client2.Install(nodes.Get(5));
-        cApps2.Start(Seconds(4.0));
-        cApps2.Stop(Seconds(simTime));
-        cApps2.Get(0)->TraceConnectWithoutContext(
-            "Tx",
-            MakeBoundCallback(&OnUdpEchoClientTx, static_cast<uint16_t>(2)));
-
-        // Pair 3: Node 10 -> Node 20 (Port 11)
-        UdpEchoServerHelper server3(11);
-        ApplicationContainer sApps3 = server3.Install(nodes.Get(20));
-        sApps3.Start(Seconds(1.0));
-        sApps3.Stop(Seconds(simTime));
-        sApps3.Get(0)->TraceConnectWithoutContext("Rx", MakeBoundCallback(&OnUdpEchoServerRx,
-            static_cast<uint16_t>(3)));
-
-        UdpEchoClientHelper client3(interfaces.GetAddress(20), 11);
-        client3.SetAttribute("MaxPackets", UintegerValue(35));
-        client3.SetAttribute("Interval", TimeValue(Seconds(2.5)));
-        client3.SetAttribute("PacketSize", UintegerValue(250));
-        ApplicationContainer cApps3 = client3.Install(nodes.Get(10));
-        cApps3.Start(Seconds(5.0));
-        cApps3.Stop(Seconds(simTime));
-        cApps3.Get(0)->TraceConnectWithoutContext(
-            "Tx",
-            MakeBoundCallback(&OnUdpEchoClientTx, static_cast<uint16_t>(3)));
-
-        // Pair 4: Node 15 -> Node 28 (Port 12)
-        UdpEchoServerHelper server4(12);
-        ApplicationContainer sApps4 = server4.Install(nodes.Get(28));
-        sApps4.Start(Seconds(1.0));
-        sApps4.Stop(Seconds(simTime));
-        sApps4.Get(0)->TraceConnectWithoutContext("Rx", MakeBoundCallback(&OnUdpEchoServerRx,
-            static_cast<uint16_t>(4)));
-
-        UdpEchoClientHelper client4(interfaces.GetAddress(28), 12);
-        client4.SetAttribute("MaxPackets", UintegerValue(30));
-        client4.SetAttribute("Interval", TimeValue(Seconds(3.0)));
-        client4.SetAttribute("PacketSize", UintegerValue(250));
-        ApplicationContainer cApps4 = client4.Install(nodes.Get(15));
-        cApps4.Start(Seconds(6.0));
-        cApps4.Stop(Seconds(simTime));
-        cApps4.Get(0)->TraceConnectWithoutContext(
-            "Tx",
-            MakeBoundCallback(&OnUdpEchoClientTx, static_cast<uint16_t>(4)));
+            UdpEchoClientHelper client(interfaces.GetAddress(dstNodes[f]), ports[f]);
+            client.SetAttribute("MaxPackets", UintegerValue(numPktsPerFlow));
+            client.SetAttribute("Interval", TimeValue(Seconds(pktIntervalSec)));
+            client.SetAttribute("PacketSize", UintegerValue(pktSize));
+            ApplicationContainer cApps = client.Install(nodes.Get(srcNodes[f]));
+            cApps.Start(Seconds(startTimes[f]));
+            cApps.Stop(Seconds(simTime));
+            cApps.Get(0)->TraceConnectWithoutContext(
+                "Tx",
+                MakeBoundCallback(&OnUdpEchoClientTx, flowId));
+        }
     }
     else
     {
@@ -886,98 +1074,56 @@ int main(int argc, char *argv[])
             sock->Bind(InetSocketAddress(Ipv4Address::GetAny(), 9999));
 
             overlayApps[i] = CreateObject<UnifiedMeshRoutingApp>();
-            overlayApps[i]->Setup(sock, 8, nodes, i, protocol, enableDtn);
+            overlayApps[i]->Setup(sock, 16, nodes, i, protocol, enableDtn);
             nodes.Get(i)->AddApplication(overlayApps[i]);
-            overlayApps[i]->SetStartTime(Seconds(1.0));
+            overlayApps[i]->SetStartTime(Seconds(0.5));
             overlayApps[i]->SetStopTime(Seconds(simTime));
         }
 
-        // Pair 1
-        for (int p = 0; p < 45; p++)
+        uint32_t srcNodes[4] = {0, 5, 10, 15};
+        uint32_t dstNodes[4] = {29, 25, 20, 28};
+        double startTimes[4] = {3.0, 4.0, 5.0, 6.0};
+
+        for (int f = 0; f < 4; ++f)
         {
-            Simulator::Schedule(Seconds(3.0 + p * 2.0),
-                &UnifiedMeshRoutingApp::SendEmergencyAlert, overlayApps[0], static_cast<uint16_t>
-                (1), interfaces.GetAddress(29), 9999, 250);
+            uint16_t flowId = static_cast<uint16_t>(f + 1);
+            for (uint32_t p = 0; p < numPktsPerFlow; ++p)
+            {
+                Simulator::Schedule(Seconds(startTimes[f] + p * pktIntervalSec),
+                                    &UnifiedMeshRoutingApp::SendEmergencyAlert,
+                                    overlayApps[srcNodes[f]],
+                                    flowId,
+                                    interfaces.GetAddress(dstNodes[f]),
+                                    9999,
+                                    pktSize);
+            }
         }
 
-        // Pair 2
-        for (int p = 0; p < 45; p++)
-        {
-            Simulator::Schedule(Seconds(4.0 + p * 2.0),
-                &UnifiedMeshRoutingApp::SendEmergencyAlert, overlayApps[5], static_cast<uint16_t>
-                (2), interfaces.GetAddress(25), 9999, 250);
-        }
-
-        // Pair 3
-        for (int p = 0; p < 35; p++)
-        {
-            Simulator::Schedule(Seconds(5.0 + p * 2.5),
-                &UnifiedMeshRoutingApp::SendEmergencyAlert, overlayApps[10],
-                static_cast<uint16_t>(3), interfaces.GetAddress(20), 9999, 250);
-        }
-
-        // Pair 4
-        for (int p = 0; p < 30; p++)
-        {
-            Simulator::Schedule(Seconds(6.0 + p * 3.0),
-                &UnifiedMeshRoutingApp::SendEmergencyAlert, overlayApps[15],
-                static_cast<uint16_t>(4), interfaces.GetAddress(28), 9999, 250);
-        }
-
-        std::cout << "Overlay/DTN Engine Active [Protocol: " << protocol << " | DTN Fallback: "
-        << (enableDtn ? "ON" : "OFF") << "]\n";
+        std::cout << "Overlay/DTN Engine Active [Protocol: " << protocol
+                  << " | DTN Fallback: " << (enableDtn ? "ON (L=16)" : "OFF") << "]\n";
     }
 
     AnimationInterface anim("emergency_mesh_" + protocol + (enableDtn ? "_DTN.xml" : ".xml"));
+    anim.SetMaxPktsPerTraceFile(0xFFFFFFFF);
+
     for (uint32_t i = 0; i < nodes.GetN(); ++i)
     {
-        std::string label = "Relay (" + std::to_string(i) + ")";
+        std::string role = (i < 24) ? "Rescuer (" : "CarrierMule (";
+        std::string label = role + std::to_string(i) + ")";
         anim.UpdateNodeSize(nodes.Get(i), 10.0, 10.0);
-        anim.UpdateNodeColor(nodes.Get(i), 255, 140, 0);
+        anim.UpdateNodeColor(nodes.Get(i), (i < 24) ? 255 : 0, (i < 24) ? 140 : 220, (i < 24) ? 0 : 220);
 
-        if (i == 0)
-        {
-            label = "Src 1";
-            anim.UpdateNodeColor(nodes.Get(i), 0, 200, 0);
-        }
-        else if (i == 5)
-        {
-            label = "Src 2";
-            anim.UpdateNodeColor(nodes.Get(i), 0, 180, 252);
-        }
-        else if (i == 10)
-        {
-            label = "Src 3";
-            anim.UpdateNodeColor(nodes.Get(i), 30, 144, 255);
-        }
-        else if (i == 15)
-        {
-            label = "Src 4";
-            anim.UpdateNodeColor(nodes.Get(i), 238, 130, 238);
-        }
-        else if (i == 29)
-        {
-            label = "Dst 1";
-            anim.UpdateNodeColor(nodes.Get(i), 255, 0, 0);
-        }
-        else if (i == 25)
-        {
-            label = "Dst 2";
-            anim.UpdateNodeColor(nodes.Get(i), 178, 34, 34);
-        }
-        else if (i == 20)
-        {
-            label = "Dst 3";
-            anim.UpdateNodeColor(nodes.Get(i), 128, 0, 128);
-        }
-        else if (i == 28)
-        {
-            label = "Dst 4";
-            anim.UpdateNodeColor(nodes.Get(i), 139, 0, 0);
-        }
+        if (i == 0) { label = "Src 1 (Rescuer)"; anim.UpdateNodeColor(nodes.Get(i), 0, 200, 0); }
+        else if (i == 5) { label = "Src 2 (Rescuer)"; anim.UpdateNodeColor(nodes.Get(i), 0, 180, 252); }
+        else if (i == 10) { label = "Src 3 (Rescuer)"; anim.UpdateNodeColor(nodes.Get(i), 30, 144, 255); }
+        else if (i == 15) { label = "Src 4 (Rescuer)"; anim.UpdateNodeColor(nodes.Get(i), 238, 130, 238); }
+        else if (i == 29) { label = "Dst 1 (CommandMule)"; anim.UpdateNodeColor(nodes.Get(i), 255, 0, 0); }
+        else if (i == 25) { label = "Dst 2 (CommandMule)"; anim.UpdateNodeColor(nodes.Get(i), 178, 34, 34); }
+        else if (i == 20) { label = "Dst 3 (RescuerPost)"; anim.UpdateNodeColor(nodes.Get(i), 128, 0, 128); }
+        else if (i == 28) { label = "Dst 4 (CommandMule)"; anim.UpdateNodeColor(nodes.Get(i), 139, 0, 0); }
         else if (protocol == "SECURITY" && (i == 7 || i == 14 || i == 21))
         {
-            label = "Malicious (" + std::to_string(i) + ")";
+            label = "Blackhole (" + std::to_string(i) + ")";
             anim.UpdateNodeColor(nodes.Get(i), 20, 20, 20);
         }
 
@@ -986,17 +1132,13 @@ int main(int argc, char *argv[])
 
     FlowMonitorHelper flowmonHelper;
     Ptr<FlowMonitor> monitor = nullptr;
-    if (protocol != "DSR") {
+    if (protocol != "DSR")
+    {
         monitor = flowmonHelper.InstallAll();
     }
 
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
-
-    // monitor->CheckForLostPackets();
-    // Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmonHelper
-    //     .GetClassifier());
-    // FlowMonitor::FlowStatsContainer stats = monitor->GetFlowStats();
 
     std::string modeLabel = protocol + (enableDtn ? "_DTN" : "");
     std::string csvFileName = "flowmon_results_" + modeLabel + ".csv";
@@ -1017,14 +1159,14 @@ int main(int argc, char *argv[])
     {
         uint32_t lost = (st.txPackets >= st.rxPackets) ? (st.txPackets - st.rxPackets) : 0;
         double pdr = (st.txPackets > 0)
-        ? (static_cast<double>(st.rxPackets) / st.txPackets * 100.0) : 0.0;
-
-        double avgDelayMs = (st.rxPackets > 0)
-        ? (st.delaySum.GetSeconds() / st.rxPackets * 1000.0) : 0.0;
+                         ? (static_cast<double>(st.rxPackets) / st.txPackets * 100.0)
+                         : 0.0;
+        double avgDelayMs =
+            (st.rxPackets > 0) ? (st.delaySum.GetSeconds() / st.rxPackets * 1000.0) : 0.0;
 
         double rxDuration = (st.timeLastRx - st.timeFirstTx).GetSeconds();
-        double tputKbps = (st.rxPackets > 0 && rxDuration > 0.0) ? (st.rxBytes * 8.0 / rxDuration
-            / 1000.0) : 0.0;
+        double tputKbps =
+            (st.rxPackets > 0 && rxDuration > 0.0) ? (st.rxBytes * 8.0 / rxDuration / 1000.0) : 0.0;
 
         totalAppTx += st.txPackets;
         totalAppRx += st.rxPackets;
@@ -1049,8 +1191,8 @@ int main(int argc, char *argv[])
     if (monitor)
     {
         monitor->CheckForLostPackets();
-        Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmonHelper
-            .GetClassifier());
+        Ptr<Ipv4FlowClassifier> classifier =
+            DynamicCast<Ipv4FlowClassifier>(flowmonHelper.GetClassifier());
         FlowMonitor::FlowStatsContainer stats = monitor->GetFlowStats();
 
         for (auto iter = stats.begin(); iter != stats.end(); ++iter)
@@ -1091,9 +1233,8 @@ int main(int argc, char *argv[])
             {
                 pdr = static_cast<double>(iter->second.rxPackets) / iter->second.txPackets * 100.0;
                 meanDelay = (iter->second.delaySum.GetSeconds() / iter->second.rxPackets) * 1000.0;
-                double rxDuration = iter->second.timeLastRxPacket.GetSeconds() - iter->second
-                .timeFirstTxPacket.GetSeconds();
-
+                double rxDuration = iter->second.timeLastRxPacket.GetSeconds() -
+                                    iter->second.timeFirstTxPacket.GetSeconds();
                 if (rxDuration > 0)
                 {
                     throughputKbps = (iter->second.rxBytes * 8.0 / rxDuration) / 1000.0;
@@ -1102,16 +1243,16 @@ int main(int argc, char *argv[])
 
             csvFile << modeLabel << "," << (iter->first + 100) << "," << tuple.sourceAddress << ","
                     << tuple.sourcePort << "," << tuple.destinationAddress << ","
-                    << tuple.destinationPort << "," << flowType << "," << iter->second.txPackets << ","
-                    << iter->second.rxPackets << "," << iter->second.lostPackets << "," << pdr << ","
-                    << meanDelay << "," << throughputKbps << "\n";
+                    << tuple.destinationPort << "," << flowType << "," << iter->second.txPackets
+                    << "," << iter->second.rxPackets << "," << iter->second.lostPackets << ","
+                    << pdr << "," << meanDelay << "," << throughputKbps << "\n";
         }
     }
 
     csvFile.close();
 
-    double overallPdr = (totalAppTx > 0) ? (static_cast<double>(totalAppRx) / totalAppTx * 100.0)
-    : 0.0;
+    double overallPdr =
+        (totalAppTx > 0) ? (static_cast<double>(totalAppRx) / totalAppTx * 100.0) : 0.0;
     double overallAvgDelayMs = (totalAppRx > 0) ? (weightedDelaySumMs / totalAppRx) : 0.0;
 
     bool summaryExists = std::ifstream("all_protocols_summary.csv").good();
@@ -1128,9 +1269,9 @@ int main(int argc, char *argv[])
     summaryFile.close();
 
     std::cout << "OVERALL SUMMARY [" << modeLabel << "]: Tx=" << totalAppTx
-                  << " | Rx=" << totalAppRx << " | PDR=" << overallPdr
-                  << "% | AvgDelay=" << overallAvgDelayMs
-                  << " ms | TotalThroughput=" << totalThroughputKbps << " Kbps\n";
+              << " | Rx=" << totalAppRx << " | PDR=" << overallPdr
+              << "% | AvgDelay=" << overallAvgDelayMs
+              << " ms | TotalThroughput=" << totalThroughputKbps << " Kbps\n";
     std::cout << "Detailed flows exported to: " << csvFileName << "\n";
     std::cout << "Aggregate row appended to : all_protocols_summary.csv\n\n";
 
