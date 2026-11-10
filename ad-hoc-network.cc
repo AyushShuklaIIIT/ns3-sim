@@ -61,9 +61,6 @@ using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("DisasterSarMeshSimulation");
 
-// ============================================================================
-// 1. Node Role Definitions & Decentralized MAC-to-IPv4 Zero-Config Hashing
-// ============================================================================
 enum DisasterNodeRole : uint8_t
 {
     ROLE_TRAPPED_VICTIM = 1,      // Nodes 0..11  : Generate SOS Anycast Distress Calls
@@ -89,7 +86,6 @@ static bool IsSarSolverNode(uint32_t nodeId)
     return (role == ROLE_SAR_FOOT_SQUAD || role == ROLE_SAR_COMMAND_VEHICLE);
 }
 
-// Autonomous Zero-Configuration MAC-to-IPv4 Hashing (No DHCP Server / No Pre-Flashed Kits)
 static Ipv4InterfaceContainer AssignAutonomousMacDerivedIpv4(NodeContainer& nodes,
                                                              NetDeviceContainer& devices)
 {
@@ -105,7 +101,6 @@ static Ipv4InterfaceContainer AssignAutonomousMacDerivedIpv4(NodeContainer& node
         uint8_t macBytes[6];
         mac.CopyTo(macBytes);
 
-        // FNV-1a 16-bit hash fold of the 6 hardware MAC bytes
         uint32_t hash = 2166136261u;
         for (int b = 0; b < 6; ++b)
         {
@@ -141,9 +136,6 @@ static Ipv4InterfaceContainer AssignAutonomousMacDerivedIpv4(NodeContainer& node
     return interfaces;
 }
 
-// ============================================================================
-// 2. End-to-End Flow Tracker (Flows 1..4 = Victim SOS Anycast, Flows 5..6 = SAR Coord)
-// ============================================================================
 struct E2EFlowStats
 {
     uint16_t flowId = 0;
@@ -238,9 +230,6 @@ static void OnUdpEchoServerRx(uint16_t flowId, Ptr<const Packet> p, const Addres
     }
 }
 
-// ============================================================================
-// 3. Wire Headers for SOS Anycast, SAR Coordination, Beacons & Location Gossip
-// ============================================================================
 enum OverlayPacketType : uint8_t
 {
     PKT_SOS_ANYCAST = 1,      // Trapped Victim SOS Distress Call (Deliver to ANY SAR Solver)
@@ -290,7 +279,6 @@ struct OverlayWireHeader
 };
 #pragma pack(pop)
 
-// Over-the-Air Learned Position Entry (Populated strictly from received packets/beacons)
 struct LearnedLocationEntry
 {
     Ipv4Address ip;
@@ -338,9 +326,6 @@ struct DtnBundle
     std::set<uint32_t> sprayedToNodes;
 };
 
-// ============================================================================
-// 4. Unified Disaster SAR & Multi-Protocol Overlay Application
-// ============================================================================
 class UnifiedMeshRoutingApp : public Application
 {
 public:
@@ -390,7 +375,6 @@ public:
         }
     }
 
-    // Trapped Victim broadcasts Destination-Agnostic SOS Distress Signal (No Destination IP!)
     void TriggerVictimSosDistress(uint16_t flowId, uint8_t trappedCount, uint32_t packetSize)
     {
         if (m_buffer.size() >= m_maxBufferSize)
@@ -412,7 +396,7 @@ public:
                             1e9f,
                             packetSize,
                             myIp,
-                            Ipv4Address::GetAny(), // 0.0.0.0 -> Destination-Agnostic Anycast
+                            Ipv4Address::GetAny(),
                             myIp,
                             9999,
                             flowId,
@@ -433,7 +417,6 @@ public:
         ProcessRoutingQueue();
     }
 
-    // SAR Team Squad / Vehicle sends Unicast Tactical Coordination Packet to another SAR Unit
     void SendSarTeamCoordination(uint16_t flowId,
                                  Ipv4Address targetSarIp,
                                  uint32_t packetSize)
@@ -484,7 +467,6 @@ public:
 protected:
     void StartApplication() override
     {
-        // Record our own onboard GNSS position in our local table
         Ipv4Address myIp = GetNodeIp(m_nodeId);
         m_locationCache[myIp.Get()] = {myIp, GetMyOwnGnssPosition(), Simulator::Now()};
 
@@ -527,8 +509,6 @@ private:
         return m_nodeId;
     }
 
-    // A node is ONLY allowed to query its OWN onboard GNSS receiver (m_nodeId)!
-    // It NEVER queries another node's MobilityModel (No Simulator God-View).
     Vector GetMyOwnGnssPosition() const
     {
         return m_allNodes.Get(m_nodeId)->GetObject<MobilityModel>()->GetPosition();
@@ -548,14 +528,12 @@ private:
         }
     }
 
-    // Looks up a remote node's position strictly from Over-the-Air Beacons & Location Cache!
     bool LookupOtaLocation(Ipv4Address targetIp, Vector& outPos) const
     {
         if (targetIp == Ipv4Address::GetAny())
         {
             return false;
         }
-        // 1. Check 1-hop neighbor beacon table first (freshest direct observation)
         for (const auto& [nIdx, nb] : m_neighborTable)
         {
             if (nb.ip == targetIp)
@@ -564,14 +542,13 @@ private:
                 return true;
             }
         }
-        // 2. Check multi-hop Over-the-Air Location Gossip Cache
         auto it = m_locationCache.find(targetIp.Get());
         if (it != m_locationCache.end())
         {
             outPos = it->second.position;
             return true;
         }
-        return false; // Position unknown! Must fall back to topological/perimeter/DTN routing
+        return false;
     }
 
     std::vector<NeighborEntry> GetActiveBeaconNeighbors()
@@ -593,7 +570,6 @@ private:
         return active;
     }
 
-    // Resolves target IP and target GPS coordinates strictly via Over-the-Air knowledge
     bool ResolveTargetForBundle(DtnBundle& b,
                                 const std::vector<NeighborEntry>& neighbors,
                                 Ipv4Address& outTargetIp,
@@ -614,16 +590,14 @@ private:
                 outTargetPos = Vector(b.dstX, b.dstY, 0.0);
                 return true;
             }
-            return false; // Destination IP is known, but GPS coordinates have not been gossiped yet
+            return false;
         }
 
-        // For PKT_SOS_ANYCAST: Find the closest SAR Solver learned via Beacons or OTA Cache
         Vector myPos = GetMyOwnGnssPosition();
         double minDist = 1e9;
         Ipv4Address bestSarIp = Ipv4Address::GetAny();
         Vector bestSarPos(0.0, 0.0, 0.0);
 
-        // 1. Direct 1-Hop SAR Neighbors
         for (const auto& nb : neighbors)
         {
             if (IsSarSolverNode(nb.nodeId))
@@ -647,7 +621,6 @@ private:
             return true;
         }
 
-        // 2. Multi-Hop SAR Gradient Advertised in 1-Hop Neighbor Beacons
         for (const auto& nb : neighbors)
         {
             if (nb.advertisedSarIp != Ipv4Address::GetAny())
@@ -671,7 +644,6 @@ private:
             return true;
         }
 
-        // 3. Any SAR Solver learned in our Over-the-Air Location Cache
         for (const auto& [ipRaw, locEntry] : m_locationCache)
         {
             uint32_t idx = GetNodeIndexByIp(locEntry.ip);
@@ -696,7 +668,6 @@ private:
             return true;
         }
 
-        // 4. Check if our L3 Routing Table (AODV/OLSR/DSDV) knows a topological path to any SAR node
         Ipv4Address dummyGw;
         for (uint32_t sarIdx = 30; sarIdx < m_allNodes.GetN(); ++sarIdx)
         {
@@ -712,7 +683,6 @@ private:
         return false;
     }
 
-    // Right-Hand Rule Planar Perimeter Forwarding for GPSR/GRP when stuck in a Local Minimum (Void)
     Ipv4Address SelectRightHandRulePerimeterNeighbor(
         const Vector& myPos,
         const Vector& dstPos,
@@ -724,7 +694,6 @@ private:
             return Ipv4Address("0.0.0.0");
         }
 
-        // Reference vector: from current node toward the previous hop (or toward destination if source)
         double refAngle = std::atan2(dstPos.y - myPos.y, dstPos.x - myPos.x);
         for (const auto& nb : neighbors)
         {
@@ -735,7 +704,6 @@ private:
             }
         }
 
-        // Pick the first neighbor counter-clockwise from refAngle (Right-Hand Rule)
         double minAngleDelta = 1e9;
         Ipv4Address bestPerimeterIp = Ipv4Address("0.0.0.0");
 
@@ -771,7 +739,6 @@ private:
         Ipv4Address myIp = GetNodeIp(m_nodeId);
         Time now = Simulator::Now();
 
-        // Keep our own GNSS coordinates fresh in the local cache
         UpdateOtaLocationCache(myIp, myPos, now);
 
         OverlayWireHeader beacon = {};
@@ -784,7 +751,6 @@ private:
         beacon.batteryPct = static_cast<float>(m_battery);
         beacon.neighborCnt = static_cast<uint8_t>(std::min<size_t>(6, activeNbs.size()));
 
-        // 1. Advertise closest known SAR Solver (Self, 1-Hop, or 2-Hop Gradient)
         Ipv4Address knownSar = IsSarSolverNode(m_nodeId) ? myIp : Ipv4Address::GetAny();
         Vector knownSarPos = myPos;
 
@@ -816,7 +782,6 @@ private:
         beacon.nearestSarGpsX = static_cast<float>(knownSarPos.x);
         beacon.nearestSarGpsY = static_cast<float>(knownSarPos.y);
 
-        // 2. Rotate through our Over-the-Air Location Cache to gossip SAR team positions across the mesh
         if (!m_locationCache.empty())
         {
             auto it = m_locationCache.begin();
@@ -833,7 +798,6 @@ private:
                                          sizeof(OverlayWireHeader));
         m_socket->SendTo(pkt, 0, InetSocketAddress(Ipv4Address::GetBroadcast(), 9999));
 
-        // Orthogonal Adaptive Trickle Beacon Scaling (--enableAdaptive=true)
         if (m_enableAdaptive)
         {
             if (activeNbs.size() == m_lastNeighborCount)
@@ -884,7 +848,6 @@ private:
         return false;
     }
 
-    // Helper: Selects best 1-hop neighbor combining Distance, Adaptive Battery Cost & Security Trust
     Ipv4Address SelectBestOverlayNeighbor(const Vector& myPos,
                                           const Vector& dstPos,
                                           bool requireCloserThanMe,
@@ -901,7 +864,7 @@ private:
         {
             if (m_enableSecurity && m_trustScores.at(nb.nodeId) < 0.5)
             {
-                continue; // Isolate malicious Blackhole neighbor flagged by Watchdog
+                continue;
             }
             double d = (nb.position - dstPos).GetLength();
             if (requireCloserThanMe && d >= myDist)
@@ -1004,7 +967,6 @@ private:
                 continue;
             }
 
-            // Step A1: Direct 1-Hop Delivery to ANY SAR Solver for Anycast SOS
             if (it->pktType == PKT_SOS_ANYCAST)
             {
                 Ipv4Address directSarIp = Ipv4Address::GetAny();
@@ -1024,7 +986,6 @@ private:
                 }
             }
 
-            // Step A2: Resolve Target IP & Over-the-Air Target GPS Coordinates
             Ipv4Address targetIp = Ipv4Address::GetAny();
             Vector dstPos(0.0, 0.0, 0.0);
             bool hasOtaGps = ResolveTargetForBundle(*it, neighbors, targetIp, dstPos);
@@ -1042,7 +1003,6 @@ private:
 
             bool forwardedPrimaryNow = false;
 
-            // Step B: Primary Multi-Hop Routing (With Orthogonal Security & Adaptive Overlays)
             if (!it->primaryForwarded)
             {
                 if (m_baseProtocol == "AODV" || m_baseProtocol == "OLSR" ||
@@ -1060,7 +1020,6 @@ private:
                         }
                     }
 
-                    // If L3 next-hop was untrusted (Blackhole) or unavailable, use Security/Adaptive neighbor fallback
                     if (!forwardedPrimaryNow && (m_enableSecurity || m_enableAdaptive) && hasOtaGps)
                     {
                         Ipv4Address fallbackIp =
@@ -1074,13 +1033,10 @@ private:
                 }
                 else if (m_baseProtocol == "GRP" || m_baseProtocol == "GPSR")
                 {
-                    // True God-View-Free GPSR/GRP:
-                    // Requires Over-the-Air learned coordinates (hasOtaGps == true)
                     if (hasOtaGps)
                     {
                         double myDist = (myPos - dstPos).GetLength();
 
-                        // Exit Condition from Perimeter Mode back to Greedy Mode
                         if (it->gpsrMode == GPSR_MODE_PERIMETER && myDist < it->failureDist)
                         {
                             it->gpsrMode = GPSR_MODE_GREEDY;
@@ -1097,7 +1053,6 @@ private:
                             }
                             else if (!neighbors.empty())
                             {
-                                // Local Minimum (Void) Detected! Stamp Failure_Distance & Switch to Perimeter Mode
                                 it->gpsrMode = GPSR_MODE_PERIMETER;
                                 it->failureDist = static_cast<float>(myDist);
                                 Ipv4Address perimNb = SelectRightHandRulePerimeterNeighbor(
@@ -1111,7 +1066,6 @@ private:
                         }
                         else
                         {
-                            // Continue Right-Hand Rule Perimeter Traversal around Void
                             Ipv4Address perimNb = SelectRightHandRulePerimeterNeighbor(
                                 myPos, dstPos, it->prevHop, neighbors);
                             if (perimNb != Ipv4Address("0.0.0.0"))
@@ -1123,7 +1077,6 @@ private:
                     }
                     else
                     {
-                        // Coordinate Blindness Mitigation: Topological L3 Fallback if GPS not yet gossiped
                         Ipv4Address l3Backup;
                         if (targetIp != Ipv4Address::GetAny() &&
                             GetActiveL3NextHop(targetIp, l3Backup))
@@ -1217,8 +1170,6 @@ private:
                 }
             }
 
-            // Step C: DTN Binary Spray-and-Wait Store-Carry-and-Forward Fallback
-            // Triggered when --enableDtn=true OR when --enableAdaptive=true detects sparse connectivity (<3 neighbors)
             bool triggerDtnSpray = m_enableDtn || (m_enableAdaptive && neighbors.size() < 3) ||
                                    (m_enableAdaptive && !it->primaryForwarded);
 
@@ -1279,7 +1230,6 @@ private:
             OverlayWireHeader wireHdr;
             packet->CopyData(reinterpret_cast<uint8_t*>(&wireHdr), sizeof(OverlayWireHeader));
 
-            // 1. Process Incoming Over-the-Air HELLO Beacon & Location Gossip
             if (wireHdr.pktType == PKT_HELLO_BEACON)
             {
                 Ipv4Address senderIp(wireHdr.srcIp);
@@ -1290,10 +1240,8 @@ private:
                 uint32_t senderIdx = GetNodeIndexByIp(senderIp);
                 Vector senderPos(wireHdr.originGpsX, wireHdr.originGpsY, 0.0);
 
-                // Record 1-hop neighbor's position in Over-the-Air Location Cache
                 UpdateOtaLocationCache(senderIp, senderPos, now);
 
-                // Record advertised nearest SAR Solver position in Over-the-Air Location Cache
                 Ipv4Address advSarIp(wireHdr.nearestSarIp);
                 Vector advSarPos(wireHdr.nearestSarGpsX, wireHdr.nearestSarGpsY, 0.0);
                 if (advSarIp != Ipv4Address::GetAny())
@@ -1301,7 +1249,6 @@ private:
                     UpdateOtaLocationCache(advSarIp, advSarPos, now);
                 }
 
-                // Record gossiped SAR Unit position in Over-the-Air Location Cache
                 Ipv4Address gossipIp(wireHdr.gossipSarIp);
                 if (gossipIp != Ipv4Address::GetAny() && wireHdr.gossipTimeNs > 0)
                 {
@@ -1328,7 +1275,6 @@ private:
                 continue;
             }
 
-            // 2. Process Incoming Watchdog Custody / Overhearing Confirmation
             if (wireHdr.pktType == PKT_WATCHDOG_CUSTODY)
             {
                 uint32_t relayIdx = GetNodeIndexByIp(Ipv4Address(wireHdr.prevHopIp));
@@ -1340,7 +1286,6 @@ private:
                 continue;
             }
 
-            // 3. Compromised / Selfish Blackhole Relay Nodes (Nodes 14, 19, 24) when Security Test is Active
             if (m_enableSecurity && (m_nodeId == 14 || m_nodeId == 19 || m_nodeId == 24))
             {
                 continue;
@@ -1350,7 +1295,6 @@ private:
             Ipv4Address srcIp(wireHdr.srcIp);
             Ipv4Address prevHopIp(wireHdr.prevHopIp);
 
-            // Learn original sender's GPS from piggybacked packet header!
             UpdateOtaLocationCache(srcIp,
                                    Vector(wireHdr.originGpsX, wireHdr.originGpsY, 0.0),
                                    NanoSeconds(wireHdr.txTimeNs));
@@ -1361,7 +1305,6 @@ private:
                                        NanoSeconds(wireHdr.txTimeNs));
             }
 
-            // 4. Check Final Delivery (Anycast SOS to ANY SAR Solver, or Unicast SAR Coord to dstIp)
             bool isSosDeliveredToSar =
                 (wireHdr.pktType == PKT_SOS_ANYCAST && IsSarSolverNode(m_nodeId));
             bool isCoordDelivered = (wireHdr.pktType == PKT_SAR_COORD && dstIp == myIp);
@@ -1375,7 +1318,6 @@ private:
                 continue;
             }
 
-            // 5. Honest Relay sends 1-hop Watchdog Custody / Forwarding Confirmation
             if (m_enableSecurity && prevHopIp != myIp)
             {
                 OverlayWireHeader wdAck = {};
@@ -1449,9 +1391,6 @@ private:
 
 uint32_t UnifiedMeshRoutingApp::s_globalSeqCounter = 0;
 
-// ============================================================================
-// 5. Main Simulation Script
-// ============================================================================
 int main(int argc, char* argv[])
 {
     double simTime = 150.0;
@@ -1459,8 +1398,8 @@ int main(int argc, char* argv[])
     std::string protocol = "AODV";
     std::string hardware = "RPI";
     bool enableDtn = false;
-    bool enableSecurity = false; // Orthogonal Cross-Layer Watchdog Security Flag
-    bool enableAdaptive = false; // Orthogonal Cross-Layer Battery & Trickle Adaptive Flag
+    bool enableSecurity = false;
+    bool enableAdaptive = false;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("simTime", "Total simulation time in seconds", simTime);
@@ -1476,7 +1415,6 @@ int main(int argc, char* argv[])
     std::transform(protocol.begin(), protocol.end(), protocol.begin(), ::toupper);
     std::transform(hardware.begin(), hardware.end(), hardware.begin(), ::toupper);
 
-    // Map legacy "SECURITY" and "ADAPTIVE" protocol strings cleanly to Option A orthogonal flags
     std::string baseProtocol = protocol;
     if (protocol == "SECURITY")
     {
@@ -1834,8 +1772,7 @@ int main(int argc, char* argv[])
                   << " | Security Watchdog: " << (enableSecurity ? "ON" : "OFF")
                   << " | Adaptive QoS: " << (enableAdaptive ? "ON" : "OFF") << "]\n";
     }
-
-    // Build descriptive label for CSV and NetAnim files
+    
     std::string protoTag = protocol;
     if (protocol != "SECURITY" && enableSecurity)
         protoTag += "_SEC";
